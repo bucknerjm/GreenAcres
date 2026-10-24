@@ -1,0 +1,16 @@
+{
+  "name": "green-acres",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-17",
+  "keep_vars": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "green-acres-db",
+      "database_id": "104cf1b5-8bcd-4038-87ac-74e04f68efeb"
+    }
+  ],
+  "triggers": {
+    "crons": []
+  }
+}

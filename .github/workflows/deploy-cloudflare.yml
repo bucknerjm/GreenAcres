@@ -1,0 +1,47 @@
+name: Deploy Green Acres to Cloudflare
+# Secrets contain only the raw token and account ID, never a curl command.
+on:
+  push:
+    branches: [main]
+    paths:
+      - worker.js
+      - scripts/deploy-cloudflare.mjs
+      - tests/**
+      - .github/workflows/deploy-cloudflare.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: green-acres-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Validate code and database safeguards
+        run: |
+          node --check worker.js
+          node tests/database-pause.mjs
+          node tests/database-reads.mjs
+          node tests/unified-tasks.mjs
+          node tests/recurrence.mjs
+          node tests/calendar-three-months.mjs
+          node tests/calendar-drag.mjs
+          node tests/date-connections.mjs
+          node tests/linked-tasks.mjs
+          node tests/independent-connections.mjs
+          node tests/owner-crop-history.mjs
+          node tests/delete-overdue.mjs
+          node tests/deploy-cloudflare.mjs
+      - name: Deploy code and preserve live settings
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-cloudflare.mjs

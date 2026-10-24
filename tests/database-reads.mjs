@@ -1,0 +1,71 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import vm from 'node:vm';
+
+const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8');
+const context=vm.createContext({Response,Headers,Request,URL,TextEncoder,TextDecoder,crypto,console,Uint8Array,atob,btoa});
+vm.runInContext(source.split('const dashboardAssets=')[0]+'\nglobalThis.testAPI={ensureTaskReadIndexes,d1ReadQuotaResponse,application,taskVisibleSQL,manage,sharedDailySQL};',context);
+const api=context.testAPI;
+const sqlite=new DatabaseSync(':memory:');
+sqlite.exec(`
+ CREATE TABLE users(id TEXT PRIMARY KEY,display_name TEXT,role TEXT);
+ CREATE TABLE tasks(id TEXT PRIMARY KEY,task_date TEXT,status TEXT,assignee_id TEXT,updated_by TEXT,assignee_ids_json TEXT,template_id TEXT,room_id TEXT,priority TEXT,created_at TEXT,deleted_at TEXT,deleted_by TEXT,end_date TEXT);
+ CREATE TABLE task_templates(id TEXT PRIMARY KEY,weekdays TEXT,recurrence_json TEXT);
+ CREATE TABLE user_rooms(user_id TEXT,room_id TEXT);
+ CREATE TABLE audit_events(id TEXT PRIMARY KEY,entity_type TEXT,entity_id TEXT,actor_id TEXT,next_json TEXT,previous_json TEXT,occurred_at TEXT);
+ INSERT INTO users VALUES('owner','James','owner'),('other-owner','Private owner','owner'),('ben','Ben Garner','manager');
+`);
+const task=sqlite.prepare('INSERT INTO tasks(id,task_date,status,assignee_id,updated_by,assignee_ids_json,template_id,room_id,priority,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
+for(let n=0;n<100;n++)task.run('task-'+n,'2026-10-20',n===0?'completed':'open','ben','ben','[]',null,'north','routine','2026-10-20');
+task.run('private','2026-10-20','open','other-owner','other-owner','[]',null,'north','routine','2026-10-20');
+const audit=sqlite.prepare('INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)');
+audit.run('completion-old','tasks','task-0','owner','{"status":"completed"}','{"status":"open"}','2026-10-19T12:00:00Z');
+audit.run('completion-new','tasks','task-0','ben','{"status":"completed"}','{"status":"blocked"}','2026-10-20T12:00:00Z');
+audit.run('edit-after-completion','tasks','task-0','owner','{"status":"completed"}','{"status":"completed"}','2026-10-20T13:00:00Z');
+// Unrelated history must not be revisited for each of the 99 unfinished tasks.
+sqlite.exec('BEGIN');
+for(let n=0;n<10000;n++)audit.run('event-'+n,'measurements','reading-'+n,'ben','{}',null,'2026-10-20');
+sqlite.exec('COMMIT');
+const template=source.match(/const tasks=await all\(db,`(SELECT tasks\.\*[\s\S]*?)`,\.\.\.\(manage/)[1];
+const queryFor=new Function('u','taskVisibleSQL','manage','sharedDailySQL','return `'+template+'`;');
+const owner={id:'owner',role:'owner'},employee={id:'ben',role:'employee'};
+const query=u=>queryFor(u,api.taskVisibleSQL,api.manage,api.sharedDailySQL);
+const params=u=>[...(u.role==='employee'?['ben','ben','ben']:[]),'2026-10-20','2026-10-20','2026-10-20'];
+const plan=u=>sqlite.prepare('EXPLAIN QUERY PLAN '+query(u)).all(...params(u)).map(r=>r.detail);
+const before=sqlite.prepare(query(owner)).all(...params(owner));
+assert(plan(owner).some(line=>line.includes('SCAN a')));
+let batches=0;
+const db={prepare(sql){return {sql};},async batch(statements){batches++;for(const {sql} of statements)sqlite.exec(sql);return [];}};
+await Promise.all([api.ensureTaskReadIndexes(db),api.ensureTaskReadIndexes(db)]);
+await api.ensureTaskReadIndexes(db);
+assert.equal(batches,1,'Concurrent and repeated requests share successful index initialization');
+for(const user of [owner,employee]){
+ const rows=sqlite.prepare(query(user)).all(...params(user));
+ assert.equal(rows.length,100);
+ assert(!rows.some(r=>r.id==='private'),'Other owner tasks remain private');
+ assert.equal(rows.find(r=>r.id==='task-0').completion_name,'Ben Garner');
+ assert.equal(rows.find(r=>r.id==='task-0').completed_at,'2026-10-20T12:00:00Z');
+ assert(!plan(user).some(line=>line.includes('SCAN a')),'Completion lookups must not scan the audit table');
+ assert(plan(user).filter(line=>line.includes('SEARCH a USING INDEX ga_audit_entity_lookup')).length===2);
+}
+assert.deepEqual(sqlite.prepare(query(owner)).all(...params(owner)),before,'Indexing preserves all task output');
+let attempts=0;
+const failingDB={prepare(sql){return {sql};},async batch(){if(++attempts===1)throw Error('quota');return [];}};
+await assert.rejects(api.ensureTaskReadIndexes(failingDB));
+await api.ensureTaskReadIndexes(failingDB);
+assert.equal(attempts,2,'Failed initialization is retried rather than cached');
+const message="D1_ERROR: Your account has exceeded D1's free tier daily row read limit.";
+const quota=api.d1ReadQuotaResponse(Error(message));
+assert.equal(quota.status,503);
+assert.equal((await quota.json()).code,'D1_DAILY_READ_LIMIT');
+assert(Number(quota.headers.get('Retry-After'))>0);
+for(const other of ['Wrong password','D1_ERROR: no such table: users','D1_ERROR: daily row write limit exceeded'])assert.equal(api.d1ReadQuotaResponse(Error(other)),null);
+// Exercise the actual login route: quota failures must become a useful 503, never a 401 redirect.
+const failingAuthDB={prepare(){return {bind(){return this;},async first(){throw Error(message);}};}};
+const response=await api.application.fetch(new Request('https://greenacresaz.com/api/auth/login',{method:'POST',headers:{Origin:'https://greenacresaz.com','Content-Type':'application/json'},body:JSON.stringify({email:'test@example.com',credential:'a'.repeat(128)})}),{DB:failingAuthDB,AUTH_MODE:'password',AUTH_PEPPER:'x'.repeat(32)});
+assert.equal(response.status,503);
+assert.equal((await response.json()).code,'D1_DAILY_READ_LIMIT');
+console.log('PASS: real SQLite task queries preserve completion details and owner privacy; both audit scans become indexed searches; initialization deduplicates and retries; login quota errors return 503.');
+console.log('Synthetic fixture: 100 visible tasks, 10,003 audit events. Before: two full audit scans per task. After: two indexed history lookups per task.');
+console.log(plan(owner).filter(line=>line.includes(' a ')||line.startsWith('SCAN a')));

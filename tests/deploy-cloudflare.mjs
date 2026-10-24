@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {deploy,deploymentMetadata} from '../scripts/deploy-cloudflare.mjs';
+const settings={bindings:[{type:'d1',name:'DB',id:'existing-db'},{type:'secret_text',name:'AUTH_PEPPER'},{type:'plain_text',name:'DATABASE_ACCESS',text:'enabled'},{type:'plain_text',name:'SCHEDULED_WORK',text:'disabled'}],compatibility_date:'2026-10-17',compatibility_flags:[],limits:{cpu_ms:50}};
+assert.throws(()=>deploymentMetadata({bindings:[]}),/DB binding/);
+assert.throws(()=>deploymentMetadata({bindings:[...settings.bindings,{type:'plain_text',name:'SCHEDULED_WORK',text:'enabled'}]}),/Scheduled work/);
+assert.deepEqual(deploymentMetadata(settings).keep_bindings,['d1','secret_text','plain_text']);
+let calls=[];
+const request=async(url,init)=>{calls.push({url,init});let result;if(url.endsWith('/tokens/verify'))result={status:'active'};else if(url.endsWith('/settings'))result={...settings,bindings:settings.bindings.map(b=>b.type==='d1'?{...b,database_id:b.id}:b)};else if(url.endsWith('/schedules'))result={schedules:[]};else{assert.equal(init.method,'PUT');const metadata=JSON.parse(await init.body.get('metadata').text());assert.equal(metadata.main_module,'worker.js');assert.deepEqual(metadata.bindings,settings.bindings.filter(b=>b.type!=='secret_text'));assert(metadata.keep_bindings.includes('d1'));assert(metadata.keep_bindings.includes('secret_text'));result={id:'green-acres'};}return Response.json({success:true,result});};
+await deploy({accountId:'a'.repeat(32),token:'x'.repeat(40),source:'const APP_VERSION = 129;',request,log:()=>{}});
+assert.equal(calls.filter(c=>c.init.method==='PUT').length,1);assert.equal(calls.filter(c=>c.init.method==='PUT')[0].url.endsWith('/green-acres'),true);
+assert(!calls.some(c=>c.url.includes('/query')||c.url.includes('/routes')));
+await assert.rejects(()=>deploy({accountId:'a'.repeat(32),source:'',request}),/API_TOKEN/);
+calls=[];await assert.rejects(()=>deploy({accountId:'a'.repeat(32),token:'x'.repeat(40),source:'',request:async(url)=>Response.json({success:true,result:url.endsWith('/tokens/verify')?{status:'active'}:{bindings:[]}})}),/Expected Green Acres/);assert.equal(calls.length,0);
+console.log('PASS: code-only deployment retains bindings/secrets, checks existing DB and disabled scheduling, rejects missing credentials, and never writes routes/schedules/database data.');
