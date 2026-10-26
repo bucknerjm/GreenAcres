@@ -1,6 +1,6 @@
-const APP_VERSION = 186;
-// GREEN ACRES — VERSION 186 — 2026-10-20
-// Latest change: distinguish completed task statuses with a blue badge.
+const APP_VERSION = 187;
+// GREEN ACRES — VERSION 187 — 2026-10-20
+// Latest change: pause clone-care tasks while the active clone rack is empty.
 // Existing overdue and future occurrences inherit the rule assignment; deliberate reassignments remain available.
 // Includes all prior updates. Replace the complete Worker; no database reset is required.
 // Verify Access JWT cryptographically. Never trust the email header.
@@ -216,6 +216,15 @@ async function ensureCloneGroups(db){
  await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS one_active_clone_group ON clone_crop_groups(status) WHERE status='active'").run();
  await db.prepare("INSERT OR IGNORE INTO clone_crop_groups(id,crop_id,label,storage_prefix) SELECT 'clones-south-36','south-36','South Crop 36','' WHERE NOT EXISTS(SELECT 1 FROM clone_crop_groups)").run();
  return await one(db,"SELECT * FROM clone_crop_groups WHERE status='active'");
+}
+const cloneCareTitle='Clones — weigh, rotate, and feed as needed';
+function cloneCareVisible(task,active){return active||task.status==='completed'||task.title!==cloneCareTitle||!task.template_id;}
+async function hasActiveClones(db){
+ const group=await ensureCloneGroups(db);if(!group)return false;
+ await ensureCloneMap(db);
+ return !!await one(db,`SELECT 1 AS active FROM clone_rack_slots s
+ JOIN clone_position_layouts l ON l.id=? || coalesce(s.tray_id,'rack:' || s.id)
+ WHERE EXISTS(SELECT 1 FROM json_each(l.assignments_json) WHERE value IS NOT NULL AND value!='') LIMIT 1`,group.storage_prefix);
 }
 async function cloneGroupSnapshot(db,group){
  await ensureCloneMap(db);await ensureCloneLife(db);const slots=await all(db,'SELECT * FROM clone_rack_slots ORDER BY id'),trays=[];
@@ -462,7 +471,8 @@ async function operationsRoutes(req,env,u,p,h){
    await ensureTaskDeletion(db);await ensureTaskConnections(db);const independent_connections=await visibleConnectedTasks(db,u);
    await ensureTaskReadIndexes(db);await syncTaskConnections(db,u,today);await materialize(db,today);
    const checklist=await all(db,`SELECT tasks.* FROM tasks WHERE deleted_at IS NULL AND (task_date>'2026-10-19' OR status='completed') AND ${taskVisibleSQL(u)} AND ${manage(u)?'1=1':`(assignee_id=? OR EXISTS(SELECT 1 FROM json_each(tasks.assignee_ids_json) WHERE value=?) OR (${sharedDailySQL} AND (room_id IS NULL OR room_id IN (SELECT room_id FROM user_rooms WHERE user_id=?))))`} AND coalesce(end_date,task_date)>=? AND task_date<=? ORDER BY task_date,created_at`,...(manage(u)?[]:[u.id,u.id,u.id]),[month+'-01',day].sort()[0],through);
-   for(const task of checklist)events.push(...taskCalendarOccurrences(task,[month+'-01',day].sort()[0],through));
+   const activeClones=await hasActiveClones(db);
+   for(const task of checklist)events.push(...(cloneCareVisible(task,activeClones)?taskCalendarOccurrences(task,[month+'-01',day].sort()[0],through):[]));
    return json({today,day,month,connections,independent_connections,connection_version:connectionVersion,forecast_through:shiftMasterDay(today,365),people:await all(db,"SELECT id,display_name FROM users WHERE id!='system' ORDER BY display_name"),plans,rules,events,warnings,notification_delivery:'in_app_only'});
   }
   if(req.method==='POST'){
@@ -1003,8 +1013,9 @@ function ensureTaskReadIndexes(db){
 async function materialize(db,day){
  await ensureAssigneeColumns(db,['tasks','task_templates']);
  date(day);await ensureRepeatColumn(db,'task_templates');const weekday=new Date(day+'T12:00:00Z').getUTCDay();
- const candidates=await all(db,'SELECT id,start_date,weekdays,recurrence_json FROM task_templates WHERE active=1 AND start_date<=? AND (end_date IS NULL OR end_date>=?)',day,day);
- const due=candidates.filter(t=>t.recurrence_json?repeatDue(repeatRule(t.recurrence_json),day):JSON.parse(t.weekdays).includes(weekday)).map(t=>t.id);
+ const candidates=await all(db,'SELECT id,title,start_date,weekdays,recurrence_json FROM task_templates WHERE active=1 AND start_date<=? AND (end_date IS NULL OR end_date>=?)',day,day);
+ const activeClones=candidates.some(t=>t.title===cloneCareTitle)?await hasActiveClones(db):false;
+ const due=candidates.filter(t=>t.title!==cloneCareTitle||activeClones).filter(t=>t.recurrence_json?repeatDue(repeatRule(t.recurrence_json),day):JSON.parse(t.weekdays).includes(weekday)).map(t=>t.id);
  if(!due.length)return;
  await db.batch([
   stmt(db,`INSERT OR IGNORE INTO tasks(id,template_id,task_date,title,room_id,assignee_id,assignee_ids_json,instructions,updated_by)
@@ -1340,9 +1351,11 @@ async function handle(req,env){
   await ensureTaskReadIndexes(db);
   await syncTaskConnections(db,u,today);
   if(day===today)await materialize(db,today);
+  const activeClones=await hasActiveClones(db);
   const tasks=await all(db,`SELECT tasks.*,(SELECT weekdays FROM task_templates WHERE id=tasks.template_id) AS repeat_weekdays,(SELECT recurrence_json FROM task_templates WHERE id=tasks.template_id) AS repeat_schedule,(SELECT display_name FROM users WHERE id=tasks.assignee_id) AS assignee_name,(SELECT display_name FROM users WHERE id=tasks.updated_by) AS updated_name,(SELECT u.display_name FROM audit_events a JOIN users u ON u.id=a.actor_id WHERE a.entity_type='tasks' AND a.entity_id=tasks.id AND json_extract(a.next_json,'$.status')='completed' AND coalesce(json_extract(a.previous_json,'$.status'),'')!='completed' ORDER BY a.rowid DESC LIMIT 1) AS completion_name,(SELECT a.occurred_at FROM audit_events a WHERE a.entity_type='tasks' AND a.entity_id=tasks.id AND json_extract(a.next_json,'$.status')='completed' AND coalesce(json_extract(a.previous_json,'$.status'),'')!='completed' ORDER BY a.rowid DESC LIMIT 1) AS completed_at FROM tasks WHERE deleted_at IS NULL AND (task_date>'2026-10-19' OR status='completed') AND ${taskVisibleSQL(u)} AND ${manage(u)?'1=1':`(assignee_id=? OR EXISTS(SELECT 1 FROM json_each(tasks.assignee_ids_json) WHERE value=?) OR (${sharedDailySQL} AND (room_id IS NULL OR room_id IN (SELECT room_id FROM user_rooms WHERE user_id=?))))`} AND ((task_date<=? AND coalesce(end_date,task_date)>=?) OR (coalesce(end_date,task_date)<? AND status!=\'completed\')) ORDER BY task_date,created_at`,...(manage(u)?[]:[u.id,u.id,u.id]),day,day,day);
+  for(let i=tasks.length-1;i>=0;i--)if(!cloneCareVisible(tasks[i],activeClones))tasks.splice(i,1);
   if(p==='/api/tasks')return json(tasks);
-  return json({date:day,counts:{open:tasks.filter(t=>t.status==='open').length,blocked:tasks.filter(t=>t.status==='blocked').length,completed:tasks.filter(t=>t.status==='completed').length},blocked:tasks.filter(t=>t.status==='blocked'),overdue:await all(db,`SELECT tasks.*,(SELECT weekdays FROM task_templates WHERE id=tasks.template_id) AS repeat_weekdays,(SELECT recurrence_json FROM task_templates WHERE id=tasks.template_id) AS repeat_schedule FROM tasks WHERE deleted_at IS NULL AND task_date>'2026-10-19' AND ${taskVisibleSQL(u)} AND coalesce(end_date,task_date)<? AND status!='completed' ORDER BY task_date LIMIT 100`,day),unassigned:tasks.filter(t=>!t.assignee_id),notifications:{sms_enabled:false,pending:(await one(db,`SELECT count(*) n FROM notification_outbox n JOIN tasks t ON t.id=n.task_id WHERE n.status='disabled' AND ${taskVisibleSQL(u,'t')}`)).n}});
+  return json({date:day,counts:{open:tasks.filter(t=>t.status==='open').length,blocked:tasks.filter(t=>t.status==='blocked').length,completed:tasks.filter(t=>t.status==='completed').length},blocked:tasks.filter(t=>t.status==='blocked'),overdue:(await all(db,`SELECT tasks.*,(SELECT weekdays FROM task_templates WHERE id=tasks.template_id) AS repeat_weekdays,(SELECT recurrence_json FROM task_templates WHERE id=tasks.template_id) AS repeat_schedule FROM tasks WHERE deleted_at IS NULL AND task_date>'2026-10-19' AND ${taskVisibleSQL(u)} AND coalesce(end_date,task_date)<? AND status!='completed' ORDER BY task_date LIMIT 100`,day)).filter(t=>cloneCareVisible(t,activeClones)),unassigned:tasks.filter(t=>!t.assignee_id),notifications:{sms_enabled:false,pending:(await one(db,`SELECT count(*) n FROM notification_outbox n JOIN tasks t ON t.id=n.task_id WHERE n.status='disabled' AND ${taskVisibleSQL(u,'t')}`)).n}});
  }
  if(p==='/api/tasks'&&req.method==='POST'){
   if(!manage(u))fail('Manager permission required',403);const b=await body(req);const room=b.room_id||null;if(room)await requireRoom(db,u,room);

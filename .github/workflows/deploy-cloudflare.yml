@@ -28,6 +28,7 @@ jobs:
       - name: Validate code and database safeguards
         run: |
           node --check worker.js
+          node tests/clone-care-tasks.mjs
           node tests/database-pause.mjs
           node tests/database-reads.mjs
           node tests/unified-tasks.mjs
