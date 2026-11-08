@@ -32,6 +32,8 @@ jobs:
           node tests/database-pause.mjs
           node tests/database-reads.mjs
           node tests/unified-tasks.mjs
+          node tests/task-completion.mjs
+          node tests/direct-task-completion.mjs
           node tests/recurrence.mjs
           node tests/calendar-three-months.mjs
           node tests/calendar-drag.mjs

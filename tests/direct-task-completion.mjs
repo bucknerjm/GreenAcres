@@ -1,0 +1,30 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const src=fs.readFileSync('worker.js','utf8');
+const assets=JSON.parse(src.split('const dashboardAssets=')[1].split(';\nconst assetsBinding=')[0]);
+const repeat='data:text/javascript;base64,'+Buffer.from(assets['/repeat-schedule.js'].body).toString('base64');
+const master=assets['/master-calendar-ui.js'].body.replace('/repeat-schedule.js?v=__APP_VERSION__',repeat);
+const {today,click}=await import('data:text/javascript;base64,'+Buffer.from(master).toString('base64'));
+globalThis.document={getElementById:()=>null};
+const record={id:'scheduled-task',kind:'linked',title:'Room task',date:'2026-11-04',status:'open',notes:'Existing note',state_version:2};
+let rows=[],editors=[],posts=[],notices=[],fail=false,refreshes=0,release=null;
+const c={day:'2026-11-07',includeGrow:false,manager:true,user:{id:'owner',role:'owner'},users:[],tasks:[],roomName:()=>'',toast:()=>{},taskSaveNotice:(...a)=>notices.push(a),showEditor:(...a)=>editors.push(a),taskTable:r=>{rows=r;return '<table></table>';},api:async(path,method,data)=>{
+ if(method){posts.push(data);if(release)await release;if(fail)throw Error('Offline');assert.equal(data.version,record.state_version);Object.assign(record,{status:data.status,notes:data.notes,state_version:record.state_version+1});return {};}
+ return path.startsWith('ops/master-calendar')?{events:[{...record}],plans:[],rules:[],warnings:[]}:{};
+},refresh:async()=>{refreshes++;await today(c);}};
+const button=action=>({dataset:{masterTask:record.id,taskAction:action},hasAttribute:()=>false,disabled:false,textContent:'Complete'});
+await today(c);assert.equal(rows.length,1);
+await click(button('completed'),c);
+assert.equal(editors.length,0);assert.equal(posts.length,1);assert.equal(record.status,'completed');assert.equal(record.notes,'Existing note');assert.equal(rows.length,1,'Completed task stays visible on completion day');assert.match(notices[0][0],/Completed:/);
+await click(button('completed'),c);assert.equal(posts.length,1,'Already-completed tasks do not save twice');
+c.day='2026-11-08';rows=[];await today(c);assert(!rows.some(r=>r.id===record.id),'Completed task drops out next day');
+await click({hasAttribute:n=>n==='data-show-completed-tasks'},c);assert.equal(rows.length,1,'Completed work is available on request');
+record.status='open';await today(c);
+await click(button('blocked'),c);assert.equal(posts.length,1);assert.match(editors.at(-1)[0],/Report blocker/);assert.match(editors.at(-1)[1],/reason is required/);
+await editors.at(-1)[3]({status:'blocked',notes:'Waiting for parts'});assert.equal(record.status,'blocked');
+await click(button('notes'),c);assert.match(editors.at(-1)[1],/type="hidden" value="blocked"/);
+assert.equal(record.status,'blocked','Opening notes never completes a task');
+fail=true;const count=posts.length;await assert.rejects(click(button('completed'),c),/Offline/);assert.equal(record.status,'blocked');assert.equal(notices.at(-1)[1],true);assert.equal(posts.length,count+1);
+fail=false;let unblock;release=new Promise(r=>unblock=r);const first=click(button('completed'),c);await click(button('completed'),c);assert.equal(posts.length,count+2,'Concurrent duplicate click is suppressed');unblock();await first;
+assert.equal(record.status,'completed');assert(refreshes>0);
+console.log('PASS direct completion: no dialog, saved status confirmed, notes preserved, visible for completion day only, completed toggle, separate blocker/notes, failed save and duplicate clicks.');

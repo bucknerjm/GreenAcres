@@ -14,12 +14,13 @@ assert.equal(record.status,'completed');assert.equal(calls[1].data.version,2);as
 calls=[];await ctx.saveTask(record,{status:'completed'});assert.equal(calls.length,2);assert(!calls.some(c=>c.method==='PATCH'));
 ctx.api=async()=>{throw Error('Service unavailable')};await assert.rejects(ctx.saveTask(record,{status:'completed'}),/Service unavailable/);assert.equal(notices.at(-1)[1],true);
 assert(master.includes('confirmedCompletedTasks.has(t.id)'));
-assert(master.includes('completionViewDay!==c.day'));
+assert(master.includes('completionViewDay!==completionDay'));
 assert(master.includes('confirmedCompletedTasks.clear()'));
 assert(!master.includes('class="primary" data-master-task="'));
 assert(!app.includes('class="primary" data-task="'));
 assert(master.includes('saved.status!==d.status'));
-assert(master.includes('row.outerHTML=unifiedWorkRow(c,saved)'));
+assert(master.includes('await c.refresh()'));
 assert(master.includes('data-task-action="blocked">Blocked'));
 assert(!master.includes("?'Edit completion':'Complete / Blocked'"));
 console.log('PASS: fresh version, saved-status readback, visible completion, duplicate click, persistent failure and consistent crop action controls.');
+
